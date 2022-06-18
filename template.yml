@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Config Rule For Check MFAPolicy Attached For IAMUsers
+Parameters:
+  WhitelistUsers:
+    Type: CommaDelimitedList
+    Default: ""
+  DenyActionWithoutMFAPolicyName:
+    Type: String
+    Default: "DenyActionWithoutMFAPolicy"
+
+Resources:
+  # ----------------------------------------------------------#
+  # Config Role for Lambda
+  # ----------------------------------------------------------#
+  LambdaForConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "LambdaForConfigRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+
+  LambdaForConfigPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "LambdaForConfigManagedPolicy"
+      Roles:
+        - !Ref LambdaForConfigRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "config:PutEvaluations"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - "iam:AttachUserPolicy"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "ssm:DescribeParameters"
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - "ssm:GetParameters"
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/mfa/*"
+
+  # ----------------------------------------------------------#
+  # Lambda Functions
+  # ----------------------------------------------------------#
+  CheckMFAPolicyAttachForIAMUsers:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src
+      Handler: check_mfa_policy_attached_for_iam_users.lambda_handler
+      Runtime: python3.8
+      Timeout: 180
+      Role: !GetAtt LambdaForConfigRole.Arn
+      Environment:
+        Variables:
+          TARGET_POLICY_NAME: !Ref DenyActionWithoutMFAPolicyName
+          SSM_PARAM_KEY: !Ref MFAWhiteUsersParameter
+      Tracing: Active
+
+  RemediationMFAPolicyAttachForIAMUsers:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src
+      Handler: RemediationMFAPolicyAttachForIAMUsers.lambda_handler
+      Runtime: python3.8
+      Timeout: 180
+      Role: !GetAtt LambdaForConfigRole.Arn
+      Environment:
+        Variables:
+          CONFIG_RULE_NAME: !Ref MFAPolicyAttachConfigRule
+          TARGET_POLICY_ARN: !Ref DenyActionWithoutMFAPolicy
+          SSM_PARAM_KEY: !Ref MFAWhiteUsersParameter
+      Tracing: Active
+
+  # ----------------------------------------------------------#
+  # Lambda Log Groups
+  # ----------------------------------------------------------#
+  CheckMFAPolicyAttachForIAMUsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CheckMFAPolicyAttachForIAMUsers}
+      RetentionInDays: 90
+
+  RemediationMFAPolicyAttachForIAMUsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${RemediationMFAPolicyAttachForIAMUsers}
+      RetentionInDays: 90
+
+  # ----------------------------------------------------------#
+  # Lambda Permissions
+  # ----------------------------------------------------------#
+  CheckMFAPolicyAttachForIAMUsersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CheckMFAPolicyAttachForIAMUsers.Arn
+      Principal: config.amazonaws.com
+
+  RemediationMFAPolicyAttachForIAMUsersPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt RemediationMFAPolicyAttachForIAMUsers.Arn
+      Principal: events.amazonaws.com
+
+  # ----------------------------------------------------------#
+  # Config Custom Rules
+  # ----------------------------------------------------------#
+  MFAPolicyAttachConfigRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn:
+      - CheckMFAPolicyAttachForIAMUsersPermission
+    Properties:
+      ConfigRuleName: mfa-policy-attach
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::IAM::User"
+          - "AWS::IAM::Policy"
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt CheckMFAPolicyAttachForIAMUsers.Arn
+        SourceDetails:
+          - EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+          - EventSource: "aws.config"
+            MessageType: "OversizedConfigurationItemChangeNotification"
+          - EventSource: "aws.config"
+            MessageType: "ScheduledNotification"
+            MaximumExecutionFrequency: One_Hour
+
+  # ----------------------------------------------------------#
+  # Remediation Events Rules
+  # ----------------------------------------------------------#
+  RemediationMFAPolicyAttachForIAMUsersEvents:
+    Type: "AWS::Events::Rule"
+    DependsOn:
+      - RemediationMFAPolicyAttachForIAMUsersPermission
+    Properties:
+      Description: CloudWatch Events about a Config Rule for IAM Users not Attached the MFA Policy.
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+        detail:
+          messageType:
+            - ComplianceChangeNotification
+          configRuleName:
+            - !Ref MFAPolicyAttachConfigRule
+          resourceType:
+            - "AWS::IAM::User"
+          newEvaluationResult:
+            complianceType:
+              - NON_COMPLIANT
+      Name: remediation-mfa-policy-attach
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RemediationMFAPolicyAttachForIAMUsers.Arn
+          Id: lambda
+
+  # ----------------------------------------------------------#
+  # SSM Parameter for MFA White Users
+  # ----------------------------------------------------------#
+  MFAWhiteUsersParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/mfa/WHITELIST_USERS"
+      Type: StringList
+      Value: !Join
+        - ","
+        - !Ref WhitelistUsers
+      Description: SSM Parameter for MFA White Users StringList.
+
+  # ----------------------------------------------------------#
+  # MFA Policy
+  # ----------------------------------------------------------#
+  DenyActionWithoutMFAPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Ref DenyActionWithoutMFAPolicyName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyDetachOthersPolicy
+            Effect: Deny
+            Action:
+              - iam:DetachUserPolicy
+              - iam:DetachGroupPolicy
+            NotResource:
+              - "arn:aws:iam::*:user/${aws:username}"
+            Condition:
+              ArnEquals:
+                iam:PolicyArn:
+                  - "arn:aws:iam::*:policy/DenyActionWithoutMFAPolicy"
+          - Sid: DenyDeleteAndChangePolicy
+            Effect: Deny
+            Action:
+              - iam:CreatePolicyVersion
+              - iam:DeletePolicyVersion
+              - iam:SetDefaultPolicyVersion
+              - iam:DeletePolicy
+            Resource:
+              - "arn:aws:iam::*:policy/DenyActionWithoutMFAPolicy"
+          - Sid: AllowViewAccountInfo
+            Effect: Allow
+            Action:
+              - iam:GetAccountPasswordPolicy
+              - iam:GetAccountSummary
+              - iam:ListVirtualMFADevices
+              - iam:ListAccountAliases
+              - iam:ListUsers
+            Resource: "*"
+          - Sid: AllowManageOwnPasswords
+            Effect: Allow
+            Action:
+              - iam:ChangePassword
+              - iam:GetUser
+              - iam:CreateLoginProfile
+              - iam:DeleteLoginProfile
+              - iam:GetLoginProfile
+              - iam:UpdateLoginProfile
+            Resource: arn:aws:iam::*:user/${aws:username}
+          - Sid: AllowManageOwnAccessKeys
+            Effect: Allow
+            Action:
+              - iam:CreateAccessKey
+              - iam:DeleteAccessKey
+              - iam:ListAccessKeys
+              - iam:UpdateAccessKey
+            Resource: arn:aws:iam::*:user/${aws:username}
+          - Sid: AllowManageOwnSigningCertificates
+            Effect: Allow
+            Action:
+              - iam:DeleteSigningCertificate
+              - iam:ListSigningCertificates
+              - iam:UpdateSigningCertificate
+              - iam:UploadSigningCertificate
+            Resource: arn:aws:iam::*:user/${aws:username}
+          - Sid: AllowManageOwnSSHPublicKeys
+            Effect: Allow
+            Action:
+              - iam:DeleteSSHPublicKey
+              - iam:GetSSHPublicKey
+              - iam:ListSSHPublicKeys
+              - iam:UpdateSSHPublicKey
+              - iam:UploadSSHPublicKey
+            Resource: arn:aws:iam::*:user/${aws:username}
+          - Sid: AllowManageOwnGitCredentials
+            Effect: Allow
+            Action:
+              - iam:CreateServiceSpecificCredential
+              - iam:DeleteServiceSpecificCredential
+              - iam:ListServiceSpecificCredentials
+              - iam:ResetServiceSpecificCredential
+              - iam:UpdateServiceSpecificCredential
+            Resource: arn:aws:iam::*:user/${aws:username}
+          - Sid: AllowManageOwnVirtualMFADevice
+            Effect: Allow
+            Action:
+              - iam:CreateVirtualMFADevice
+              - iam:DeleteVirtualMFADevice
+            Resource: arn:aws:iam::*:mfa/${aws:username}
+          - Sid: AllowManageOwnUserMFA
+            Effect: Allow
+            Action:
+              - iam:DeactivateMFADevice
+              - iam:EnableMFADevice
+              - iam:ListMFADevices
+              - iam:ResyncMFADevice
+            Resource: arn:aws:iam::*:user/${aws:username}
+          - Sid: DenyAllExceptListIfNoMFAOrGreaterThanTime
+            Effect: Deny
+            NotAction:
+              - iam:CreateVirtualMFADevice
+              - iam:EnableMFADevice
+              - iam:ChangePassword
+              - iam:GetAccountPasswordPolicy
+              - iam:CreateLoginProfile
+              - iam:DeleteLoginProfile
+              - iam:GetLoginProfile
+              - iam:UpdateLoginProfile
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ListVirtualMFADevices
+              - iam:ResyncMFADevice
+              - sts:GetSessionToken
+            Resource: "*"
+            Condition:
+              NumericGreaterThanIfExists:
+                aws:MultiFactorAuthAge: 3600
+
+# ------------------------------------------------------------#
+# Output Parameters
+# ------------------------------------------------------------#
+Outputs:
+  LambdaForConfigRoleArn:
+    Value: !GetAtt LambdaForConfigRole.Arn
+    Export:
+      Name: !Sub "LambdaForConfigRoleArn"
